@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Dodge the Blocks — Simple Game</title>
+<style>
+  :root {
+    --bg1: #0f172a;
+    --bg2: #0b1220;
+    --accent: #ff6b6b;
+    --player: #4ade80;
+    --block: #60a5fa;
+  }
+  html,body{height:100%;margin:0;font-family:Inter,system-ui,Arial;background:linear-gradient(180deg,var(--bg1),var(--bg2));color:#e6eef8}
+  .container{
+    height:100vh;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:14px;padding:20px;
+  }
+  canvas{
+    background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.12));
+    border-radius:12px;
+    box-shadow: 0 10px 30px rgba(2,6,23,0.7);
+    touch-action: none;
+  }
+  .ui{
+    display:flex;gap:10px;align-items:center;flex-wrap:wrap;justify-content:center;
+  }
+  button{
+    background:transparent;border:1px solid rgba(255,255,255,0.12);padding:8px 12px;border-radius:8px;color:#e6eef8;cursor:pointer;
+  }
+  button.primary{background:linear-gradient(90deg,var(--accent),#ff9a6b);border:none;color:#071021}
+  .scorebox{font-weight:600;opacity:0.95}
+  .hint{font-size:0.9rem;color:rgba(230,238,248,0.7)}
+  @media(min-width:900px){
+    canvas{width:520px;height:700px}
+  }
+  @media(max-width:899px){
+    canvas{width:360px;height:620px}
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h2>Dodge the Blocks</h2>
+  <div class="ui">
+    <div class="scorebox">Score: <span id="score">0</span></div>
+    <div class="scorebox">High: <span id="high">0</span></div>
+    <button id="start" class="primary">Start / Restart</button>
+    <button id="pause">Pause</button>
+  </div>
+  <canvas id="game"></canvas>
+  <div class="hint">Use ← → arrows or touch left/right to move. Survive as long as you can! 😎</div>
+</div>
+
+<script>
+/*
+  Dodge the Blocks
+  - Player: small rectangle at bottom, move left/right.
+  - Blocks fall from top; avoid collisions.
+  - Score increases over time; difficulty increases gradually.
+  - High score stored in localStorage.
+*/
+
+(() => {
+  // ---- Setup ----
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  // Set canvas size to CSS size for crisp rendering
+  function fitCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * devicePixelRatio);
+    canvas.height = Math.floor(rect.height * devicePixelRatio);
+    ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+  }
+  fitCanvas();
+  window.addEventListener('resize', () => { fitCanvas(); });
+
+  // UI elements
+  const scoreEl = document.getElementById('score');
+  const highEl = document.getElementById('high');
+  const startBtn = document.getElementById('start');
+  const pauseBtn = document.getElementById('pause');
+
+  // Game state
+  let game = null;
+
+  // ---- Game Class ----
+  class Game {
+    constructor() {
+      // logical dimensions (match CSS canvas size for simplicity)
+      this.width = canvas.width / devicePixelRatio;
+      this.height = canvas.height / devicePixelRatio;
+
+      this.player = {
+        w: Math.max(30, this.width * 0.12),
+        h: 18,
+        x: (this.width / 2),
+        y: this.height - 40,
+        speed: Math.max(4, this.width * 0.012),
+      };
+
+      this.blocks = [];
+      this.spawnTimer = 0;
+      this.spawnInterval = 900; // ms
+      this.lastTime = performance.now();
+      this.score = 0;
+      this.isRunning = false;
+      this.isPaused = false;
+      this.difficulty = 0; // increases over time
+      this.high = parseInt(localStorage.getItem('dodge_high') || '0', 10);
+      highEl.textContent = this.high;
+      this.input = { left:false, right:false, touchX: null };
+      this.touchSide = null;
+
+      this.bindEvents();
+    }
+
+    bindEvents(){
+      // Keyboard
+      window.addEventListener('keydown', (e) => {
+        if(e.key === 'ArrowLeft' || e.key === 'a') this.input.left = true;
+        if(e.key === 'ArrowRight' || e.key === 'd') this.input.right = true;
+      });
+      window.addEventListener('keyup', (e) => {
+        if(e.key === 'ArrowLeft' || e.key === 'a') this.input.left = false;
+        if(e.key === 'ArrowRight' || e.key === 'd') this.input.right = false;
+      });
+
+      // Touch controls (simple: tap left/right half)
+      canvas.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        const t = e.touches[0];
+        const rect = canvas.getBoundingClientRect();
+        const x = t.clientX - rect.left;
+        this.touchSide = (x < rect.width / 2) ? 'left' : 'right';
+        if(this.touchSide === 'left'){ this.input.left = true; this.input.right = false; }
+        else { this.input.right = true; this.input.left = false; }
+      }, { passive:false });
+
+      canvas.addEventListener('touchend', (e) => {
+        e.preventDefault();
+        this.input.left = false; this.input.right = false; this.touchSide = null;
+      }, { passive:false });
+
+      // Mouse for desktop: drag optionally
+      let dragging = false;
+      canvas.addEventListener('mousedown', (e) => {
+        dragging = true;
+        moveToMouse(e);
+      });
+      window.addEventListener('mouseup', ()=>{ dragging=false; });
+      canvas.addEventListener('mousemove', (e) => { if(dragging) moveToMouse(e); });
+
+      const moveToMouse = (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        // center player to x
+        this.player.x = Math.max(this.player.w/2, Math.min(this.width - this.player.w/2, x));
+      };
+    }
+
+    start() {
+      this.blocks = [];
+      this.spawnTimer = 0;
+      this.spawnInterval = 900;
+      this.score = 0;
+      this.difficulty = 0;
+      this.isRunning = true;
+      this.isPaused = false;
+      this.lastTime = performance.now();
+      this.player.x = this.width / 2;
+      requestAnimationFrame(this.loop.bind(this));
+    }
+
+    pauseToggle() {
+      if(!this.isRunning) return;
+      this.isPaused = !this.isPaused;
+      pauseBtn.textContent = this.isPaused ? 'Resume' : 'Pause';
+      if(!this.isPaused) {
+        this.lastTime = performance.now();
+        requestAnimationFrame(this.loop.bind(this));
+      }
+    }
+
+    spawnBlock() {
+      const bwMin = Math.max(22, this.width * 0.12);
+      const bwMax = Math.max(40, this.width * 0.28);
+      const w = rand(bwMin, bwMax);
+      const x = rand(w/2, this.width - w/2);
+      const speedBase = 1.2 + this.difficulty * 0.08;
+      const sizeScale = rand(0.9,1.2);
+      this.blocks.push({
+        x, y: -30, w: w * sizeScale, h: 16 + Math.random()*18,
+        vy: speedBase + Math.random()*1.6 + this.difficulty*0.6
+      });
+    }
+
+    update(dt) {
+      // Difficulty grows slowly
+      this.difficulty += dt * 0.00007; // tuned
+      // spawn faster as difficulty grows
+      this.spawnTimer += dt;
+      const interval = Math.max(300, this.spawnInterval - this.difficulty*200);
+      if(this.spawnTimer > interval) {
+        this.spawnTimer = 0;
+        this.spawnBlock();
+      }
+
+      // Move player
+      if(this.input.left) this.player.x -= this.player.speed + this.difficulty*0.4;
+      if(this.input.right) this.player.x += this.player.speed + this.difficulty*0.4;
+
+      // clamp player
+      this.player.x = Math.max(this.player.w/2, Math.min(this.width - this.player.w/2, this.player.x));
+
+      // Move blocks
+      for(let b of this.blocks){
+        b.y += b.vy;
+      }
+
+      // remove offscreen blocks and increase score
+      for(let i=this.blocks.length-1;i>=0;i--){
+        if(this.blocks[i].y - this.blocks[i].h > this.height){
+          this.blocks.splice(i,1);
+          this.score += 5; // points for dodging
+        }
+      }
+
+      // continuous score
+      this.score += dt * 0.01; // small incremental
+
+      // collision detection (AABB)
+      const px1 = this.player.x - this.player.w/2;
+      const px2 = this.player.x + this.player.w/2;
+      const py1 = this.player.y - this.player.h/2;
+      const py2 = this.player.y + this.player.h/2;
+      for(let b of this.blocks){
+        const bx1 = b.x - b.w/2;
+        const bx2 = b.x + b.w/2;
+        const by1 = b.y - b.h/2;
+        const by2 = b.y + b.h/2;
+        if(px1 < bx2 && px2 > bx1 && py1 < by2 && py2 > by1){
+          this.gameOver();
+          return;
+        }
+      }
+    }
+
+    draw() {
+      // clear
+      ctx.fillStyle = '#071022';
+      ctx.fillRect(0,0,this.width,this.height);
+
+      // background subtle grid or gradient
+      const g = ctx.createLinearGradient(0,0,0,this.height);
+      g.addColorStop(0, 'rgba(255,255,255,0.01)');
+      g.addColorStop(1, 'rgba(0,0,0,0.05)');
+      ctx.fillStyle = g;
+      ctx.fillRect(0,0,this.width,this.height);
+
+      // draw player
+      const px = this.player.x;
+      const py = this.player.y;
+      const pw = this.player.w;
+      const ph = this.player.h;
+      roundedRect(ctx, px - pw/2, py - ph/2, pw, ph, 6, '#4ade80');
+
+      // draw blocks
+      for(let b of this.blocks){
+        const bx = b.x - b.w/2;
+        const by = b.y - b.h/2;
+        roundedRect(ctx, bx, by, b.w, b.h, 6, '#60a5fa');
+      }
+
+      // HUD
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = '14px system-ui,Inter,Arial';
+      ctx.fillText('Score: ' + Math.floor(this.score), 12, 20);
+      ctx.fillText('High: ' + Math.floor(this.high), 12, 40);
+
+      if(!this.isRunning){
+        ctx.fillStyle = 'rgba(0,0,0,0.5)';
+        ctx.fillRect(this.width/2 - 140, this.height/2 - 44, 280, 88);
+        ctx.fillStyle = '#fff';
+        ctx.font = '20px Inter, system-ui, Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Press Start to play', this.width/2, this.height/2 + 6);
+        ctx.textAlign = 'start';
+      }
+      if(this.isPaused){
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillRect(0,0,this.width,this.height);
+        ctx.fillStyle = '#fff';
+        ctx.font = '28px Inter, system-ui, Arial';
+        ctx.textAlign = 'center';
+        ctx.fillText('Paused', this.width/2, this.height/2);
+        ctx.textAlign = 'start';
+      }
+    }
+
+    loop(now) {
+      if(!this.isRunning || this.isPaused) return;
+      const dt = Math.min(40, now - this.lastTime); // ms, clamp
+      this.lastTime = now;
+      this.update(dt);
+      this.draw();
+      // update UI
+      scoreEl.textContent = Math.floor(this.score);
+      if(this.score > this.high) {
+        this.high = Math.floor(this.score);
+        highEl.textContent = this.high;
+      }
+      requestAnimationFrame(this.loop.bind(this));
+    }
+
+    gameOver(){
+      this.isRunning = false;
+      // save high score
+      const final = Math.floor(this.score);
+      const prev = parseInt(localStorage.getItem('dodge_high') || '0', 10);
+      if(final > prev) localStorage.setItem('dodge_high', final);
+      // show overlay
+      setTimeout(()=> {
+        if(confirm('Game Over — Score: ' + final + '\nPlay again?')) {
+          this.start();
+        }
+      }, 50);
+    }
+  }
+
+  // ---- Helpers ----
+  function rand(a,b){ return a + Math.random()*(b-a); }
+  function roundedRect(ctx,x,y,w,h,r,color){
+    ctx.save();
+    ctx.fillStyle = color;
+    const rad = r || 6;
+    ctx.beginPath();
+    ctx.moveTo(x+rad,y);
+    ctx.arcTo(x+w,y,x+w,y+h,rad);
+    ctx.arcTo(x+w,y+h,x,y+h,rad);
+    ctx.arcTo(x,y+h,x,y,rad);
+    ctx.arcTo(x,y,x+w,y,rad);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ---- UI bindings ----
+  startBtn.addEventListener('click', () => {
+    if(!game) game = new Game();
+    game.start();
+  });
+  pauseBtn.addEventListener('click', () => {
+    if(game) game.pauseToggle();
+  });
+
+  // Automatic create game object for immediate play if user presses start
+  // Fit canvas initial values
+  (function setCanvasCSSSize(){
+    // do nothing extra; canvas CSS size is set via media queries.
+  })();
+
+  // Start with a static draw
+  // instantiate and draw a non-running scene
+  game = new Game();
+  game.draw();
+
+})();
+</script>
+</body>
+</html>
